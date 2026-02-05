@@ -1,4 +1,4 @@
-package app
+package installer
 
 // Setup git hook on checkout
 func Install() error {

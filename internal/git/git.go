@@ -4,17 +4,15 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-
-	"github.com/joho/godotenv"
 )
 
 func loadRepositoryPath() string {
-	err := godotenv.Load()
+	path, err := os.Getwd()
+
 	if err != nil {
-		panic("Error loading .env file")
+		fmt.Println("Error loading repository path:", err)
 	}
-	repoPath := os.Getenv("REPO_PATH")
-	return repoPath
+	return path
 }
 
 func GetBranchStatus() (string, error) {
