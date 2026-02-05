@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/SaNog2/timetracker/internal/app"
+	"github.com/SaNog2/timetracker/internal/app/tracker"
 )
 
 func main() {
@@ -12,17 +12,17 @@ func main() {
 
 	switch command {
 	case "start":
-		app.Start()
+		tracker.Start()
 	case "stop":
-		app.Stop()
+		tracker.Stop()
 	case "switch":
-		app.Stop()
-		app.Start()
+		tracker.Stop()
+		tracker.Start()
 	case "report":
-		app.Report()
+		tracker.Report()
 	case "install":
 		panic("Not implemented")
-		// app.Install("", "")
+		// tracker.Install("", "")
 	default:
 		fmt.Println("Unknown command. Usage: timetracker <start | stop | switch | report>")
 		os.Exit(1)
