@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/SaNog2/timetracker/internal/adapters/git"
 	"github.com/SaNog2/timetracker/internal/adapters/storage"
 	"github.com/SaNog2/timetracker/internal/app"
 	"github.com/SaNog2/timetracker/internal/app/tracker"
@@ -31,5 +32,6 @@ func bootstrap() *app.App {
 
 func buildTrackerService() *tracker.TrackerService {
 	storage, _ := storage.NewJSONFileStorage()
-	return tracker.NewTrackerService(storage)
+	gitProvider, _ := git.NewLocalGitRepository()
+	return tracker.NewTrackerService(storage, gitProvider)
 }

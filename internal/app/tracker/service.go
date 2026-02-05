@@ -7,11 +7,11 @@ import (
 	"time"
 
 	"github.com/SaNog2/timetracker/internal/domain"
-	"github.com/SaNog2/timetracker/internal/git"
 )
 
 type TrackerService struct {
 	storage Storage
+	git     GitProvider
 }
 
 type TaskTotal struct {
@@ -21,9 +21,10 @@ type TaskTotal struct {
 	LastEnded time.Time
 }
 
-func NewTrackerService(storage Storage) *TrackerService {
+func NewTrackerService(storage Storage, git GitProvider) *TrackerService {
 	return &TrackerService{
 		storage: storage,
+		git:     git,
 	}
 }
 
@@ -33,7 +34,7 @@ func (t *TrackerService) Start() error {
 		entries = domain.TrackingEntries{}
 	}
 
-	branchName, err := git.GetBranchStatus()
+	branchName, err := t.git.GetBranchStatus()
 	if err != nil {
 		return err
 	}
