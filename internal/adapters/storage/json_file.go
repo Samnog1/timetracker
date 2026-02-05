@@ -1,15 +1,25 @@
-package adapters
+package storage
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/SaNog2/timetracker/internal/domain"
 )
 
-// Saves entries to .config/timetracker/sessions.json for UNIX systems
+type JSONFileStorage struct {
+	path string
+}
+
+func NewJSONFileStorage() (*JSONFileStorage, error) {
+	path, err := sessionFilePath()
+	if err != nil {
+		return nil, err
+	}
+	return &JSONFileStorage{path: path}, nil
+}
+
 func sessionFilePath() (string, error) {
 	cfg, err := os.UserConfigDir()
 	if err != nil {
@@ -22,14 +32,8 @@ func sessionFilePath() (string, error) {
 	return filepath.Join(dir, "sessions.json"), nil
 }
 
-func LoadEntries() (domain.TrackingEntries, error) {
-	sessionFile, err := sessionFilePath()
-	fmt.Println("Sent to", sessionFile)
-	if err != nil {
-		return domain.TrackingEntries{}, err
-	}
-
-	data, err := os.ReadFile(sessionFile)
+func (f *JSONFileStorage) LoadEntries() (domain.TrackingEntries, error) {
+	data, err := os.ReadFile(f.path)
 	if err != nil {
 		return domain.TrackingEntries{}, err
 	}
@@ -44,16 +48,12 @@ func LoadEntries() (domain.TrackingEntries, error) {
 	return entries, nil
 }
 
-func SaveEntries(entries domain.TrackingEntries) error {
-	sessionFile, err := sessionFilePath()
-	if err != nil {
-		return err
-	}
+func (f *JSONFileStorage) SaveEntries(entries domain.TrackingEntries) error {
 	jsonData, err := json.Marshal(entries)
 	if err != nil {
 		return err
 	}
-	err = os.WriteFile(sessionFile, jsonData, 0644)
+	err = os.WriteFile(f.path, jsonData, 0644)
 	if err != nil {
 		return err
 	}
