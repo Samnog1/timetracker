@@ -1,9 +1,9 @@
 package git
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 )
 
 type LocalGitRepository struct {
@@ -32,5 +32,5 @@ func (localGit *LocalGitRepository) GetBranchStatus() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("%s", out), nil
+	return strings.TrimSpace(string(out)), nil
 }

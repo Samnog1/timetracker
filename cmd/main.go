@@ -31,7 +31,15 @@ func bootstrap() *app.App {
 }
 
 func buildTrackerService() *tracker.TrackerService {
-	storage, _ := storage.NewJSONFileStorage()
-	gitProvider, _ := git.NewLocalGitRepository()
+	storage, err := storage.NewJSONFileStorage()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing storage: %v\n", err)
+		os.Exit(1)
+	}
+	gitProvider, err := git.NewLocalGitRepository()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initializing git provider: %v\n", err)
+		os.Exit(1)
+	}
 	return tracker.NewTrackerService(storage, gitProvider)
 }
