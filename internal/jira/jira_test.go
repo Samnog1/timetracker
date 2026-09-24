@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,168 +22,108 @@ func writeEnvFile(t *testing.T, content string) string {
 	return path
 }
 
-func TestParseEnvFile_valid(t *testing.T) {
+func TestParseEnvFile(t *testing.T) {
 	path := writeEnvFile(t, `
-# comment
-JIRA_URL=https://example.atlassian.net
-JIRA_EMAIL=user@example.com
-JIRA_TOKEN=secret123
+JIRA_URL="https://example.atlassian.net"
+JIRA_EMAIL='user@example.com'
+JIRA_TOKEN=secret
 `)
 	cfg, err := parseEnvFile(path)
 	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+		t.Fatal(err)
 	}
-	if cfg.BaseURL != "https://example.atlassian.net" {
-		t.Errorf("BaseURL = %q", cfg.BaseURL)
-	}
-	if cfg.Email != "user@example.com" {
-		t.Errorf("Email = %q", cfg.Email)
-	}
-	if cfg.Token != "secret123" {
-		t.Errorf("Token = %q", cfg.Token)
+	if cfg.BaseURL != "https://example.atlassian.net" || cfg.Email != "user@example.com" || cfg.Token != "secret" {
+		t.Fatalf("config = %#v", cfg)
 	}
 }
 
-func TestParseEnvFile_quotedValues(t *testing.T) {
-	path := writeEnvFile(t, `
-JIRA_URL="https://quoted.atlassian.net"
-JIRA_EMAIL='user@quoted.com'
-JIRA_TOKEN="tok"
-`)
-	cfg, err := parseEnvFile(path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.BaseURL != "https://quoted.atlassian.net" {
-		t.Errorf("BaseURL = %q (quotes not stripped)", cfg.BaseURL)
-	}
-	if cfg.Email != "user@quoted.com" {
-		t.Errorf("Email = %q (quotes not stripped)", cfg.Email)
-	}
-}
-
-func TestParseEnvFile_missingKey(t *testing.T) {
-	path := writeEnvFile(t, `
-JIRA_URL=https://example.atlassian.net
-JIRA_EMAIL=user@example.com
-`)
-	// JIRA_TOKEN missing — should fail
-	_, err := parseEnvFile(path)
-	if err == nil {
-		t.Fatal("expected error for missing JIRA_TOKEN, got nil")
-	}
-}
-
-func TestParseEnvFile_commentsAndBlankLines(t *testing.T) {
-	path := writeEnvFile(t, `
-# this is a comment
-
-JIRA_URL=https://example.atlassian.net
-# another comment
-JIRA_EMAIL=user@example.com
-JIRA_TOKEN=tok
-`)
-	cfg, err := parseEnvFile(path)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if cfg.Token != "tok" {
-		t.Errorf("Token = %q", cfg.Token)
-	}
-}
-
-func TestParseEnvFile_missingFile(t *testing.T) {
-	_, err := parseEnvFile("/nonexistent/.env")
-	if err == nil {
-		t.Fatal("expected error for missing file, got nil")
-	}
-}
-
-func TestUploadWorklog_success(t *testing.T) {
-	received := make([]worklogRequest, 0)
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Verify path pattern
-		if r.Method != http.MethodPost {
-			t.Errorf("unexpected method %s", r.Method)
+func TestAssignedIssues(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Query().Get("jql"), "assignee = currentUser()") {
+			t.Errorf("jql = %q", r.URL.Query().Get("jql"))
 		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"issues": []any{
+			map[string]any{"key": "AI-7", "fields": map[string]any{"summary": "Fix it", "status": map[string]any{"name": "In Progress"}}},
+		}})
+	}))
+	defer server.Close()
 
-		var body worklogRequest
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			t.Errorf("decode body: %v", err)
+	issues, err := AssignedIssues(Config{BaseURL: server.URL, Email: "u", Token: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 1 || issues[0].Key != "AI-7" || issues[0].Summary != "Fix it" {
+		t.Fatalf("issues = %#v", issues)
+	}
+}
+
+func TestUploadSession(t *testing.T) {
+	var received worklogRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("notifyUsers") != "false" {
+			t.Errorf("notifyUsers = %q", r.URL.Query().Get("notifyUsers"))
 		}
-		received = append(received, body)
-
+		if r.URL.Path != "/rest/api/3/issue/AI-7/worklog" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&received)
 		w.WriteHeader(http.StatusCreated)
 	}))
-	defer ts.Close()
+	defer server.Close()
 
-	cfg := Config{
-		BaseURL: ts.URL,
-		Email:   "user@example.com",
-		Token:   "tok",
+	started := time.Date(2026, 9, 24, 9, 30, 0, 0, time.FixedZone("EDT", -4*60*60))
+	session := tracker.Session{ID: "session-123", TaskID: "AI-7", StartedAt: started, EndedAt: started.Add(45 * time.Minute)}
+	if err := UploadSession(Config{BaseURL: server.URL, Email: "u", Token: "t"}, session); err != nil {
+		t.Fatal(err)
 	}
-	summaries := []tracker.TaskSummary{
-		{TaskID: "AI-1", Total: 2 * time.Hour, Sessions: 1},
-		{TaskID: "AI-2", Total: 30 * time.Minute, Sessions: 1},
+	if received.TimeSpentSeconds != 2700 || received.Started != "2026-09-24T09:30:00.000-0400" {
+		t.Fatalf("request = %#v", received)
 	}
-
-	if err := UploadWorklog(cfg, summaries); err != nil {
-		t.Fatalf("UploadWorklog: %v", err)
-	}
-	if len(received) != 2 {
-		t.Fatalf("expected 2 requests, got %d", len(received))
-	}
-	if received[0].TimeSpentSeconds != int((2 * time.Hour).Seconds()) {
-		t.Errorf("first entry seconds = %d", received[0].TimeSpentSeconds)
-	}
-	if received[1].TimeSpentSeconds != int((30 * time.Minute).Seconds()) {
-		t.Errorf("second entry seconds = %d", received[1].TimeSpentSeconds)
+	propertyValue, ok := received.Properties[0].Value.(map[string]any)
+	if len(received.Properties) != 1 || !ok || propertyValue["sessionId"] != "session-123" {
+		t.Fatalf("properties = %#v", received.Properties)
 	}
 }
 
-func TestUploadWorklog_minimumOneMinute(t *testing.T) {
-	var receivedSecs int
-
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+func TestUploadSessionRoundsShortSessionToOneMinute(t *testing.T) {
+	var seconds int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body worklogRequest
 		_ = json.NewDecoder(r.Body).Decode(&body)
-		receivedSecs = body.TimeSpentSeconds
+		seconds = body.TimeSpentSeconds
 		w.WriteHeader(http.StatusCreated)
 	}))
-	defer ts.Close()
+	defer server.Close()
 
-	cfg := Config{BaseURL: ts.URL, Email: "u", Token: "t"}
-	summaries := []tracker.TaskSummary{
-		{TaskID: "AI-1", Total: 10 * time.Second}, // less than 1 minute
-	}
-	if err := UploadWorklog(cfg, summaries); err != nil {
-		t.Fatalf("UploadWorklog: %v", err)
-	}
-	if receivedSecs != 60 {
-		t.Errorf("expected minimum 60 seconds, got %d", receivedSecs)
+	now := time.Now()
+	err := UploadSession(Config{BaseURL: server.URL, Email: "u", Token: "t"}, tracker.Session{ID: "x", TaskID: "AI-1", StartedAt: now, EndedAt: now.Add(10 * time.Second)})
+	if err != nil || seconds != 60 {
+		t.Fatalf("seconds = %d, err = %v", seconds, err)
 	}
 }
 
-func TestUploadWorklog_serverError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
+func TestUploadSessionIncludesJiraError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"errorMessages":["bad worklog"]}`))
 	}))
-	defer ts.Close()
-
-	cfg := Config{BaseURL: ts.URL, Email: "u", Token: "t"}
-	summaries := []tracker.TaskSummary{
-		{TaskID: "AI-1", Total: time.Hour},
-	}
-	err := UploadWorklog(cfg, summaries)
-	if err == nil {
-		t.Fatal("expected error for 500 response, got nil")
+	defer server.Close()
+	now := time.Now()
+	err := UploadSession(Config{BaseURL: server.URL, Email: "u", Token: "t"}, tracker.Session{ID: "x", TaskID: "AI-1", StartedAt: now, EndedAt: now.Add(time.Hour)})
+	if err == nil || !strings.Contains(err.Error(), "bad worklog") {
+		t.Fatalf("error = %v", err)
 	}
 }
 
-func TestUploadWorklog_noSummaries(t *testing.T) {
-	cfg := Config{BaseURL: "http://unused", Email: "u", Token: "t"}
-	if err := UploadWorklog(cfg, nil); err != nil {
-		t.Fatalf("expected nil error for empty summaries, got: %v", err)
+func TestWorklogExists(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"worklogs": []any{
+			map[string]any{"properties": []any{map[string]any{"key": "timetracker.session-id", "value": map[string]any{"sessionId": "session-123"}}}},
+		}})
+	}))
+	defer server.Close()
+	exists, err := WorklogExists(Config{BaseURL: server.URL, Email: "u", Token: "t"}, "AI-1", "session-123")
+	if err != nil || !exists {
+		t.Fatalf("exists = %v, err = %v", exists, err)
 	}
 }

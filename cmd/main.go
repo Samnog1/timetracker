@@ -1,8 +1,9 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,27 +19,33 @@ import (
 	"github.com/SaNog2/timetracker/internal/tracker"
 )
 
-const usage = `Usage: timetracker <command>
+const usage = `Usage: timetracker <command> [arguments]
 
 Commands:
-  start      Start tracking time on the current branch's Jira task
-  stop       Stop all running sessions
-  switch     Stop current session and start a new one (for git hooks)
-  report     Show a summary of time logged per task
-  upload     Review pending time and upload worklogs to Jira
-  install    Install git hooks and the background daemon in the current repo
-  uninstall  Remove git hooks and (if no repos left) the daemon
-  daemon     Run the idle watchdog (managed by systemd/launchd — not for direct use)
+  start [ISSUE]  Start the branch issue, an explicit issue, or the issue picker
+  pick           Pick an assigned Jira issue with fzf
+  sync           Switch the timer to the current branch issue (for git hooks)
+  stop           Stop the active timer and ask before uploading
+  pause          Pause the active timer
+  resume         Resume the active timer
+  toggle         Toggle pause/resume
+  status [--bar] Show current timer state
+  report [--verbose]
+                 Show pending time, or all recorded time with --verbose
+  upload         Ask before uploading each pending session
+  install        Install git hooks and the background daemon
+  uninstall      Remove git hooks and, when unused, the daemon
+  daemon         Watch Omarchy lock state (managed by systemd/launchd)
 `
 
 const hookPostCheckout = `#!/bin/sh
-# managed by timetracker — do not edit
-[ "$3" = "1" ] && timetracker switch
+# managed by timetracker - do not edit
+[ "$3" = "1" ] && timetracker sync >/dev/null 2>&1 || true
 `
 
 const hookPostCommit = `#!/bin/sh
-# managed by timetracker — do not edit
-timetracker start
+# managed by timetracker - do not edit
+timetracker ensure >/dev/null 2>&1 || true
 `
 
 const hookMarker = "# managed by timetracker"
@@ -49,14 +56,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	switch os.Args[1] {
-	case "daemon":
+	command := os.Args[1]
+	if command == "daemon" {
 		runDaemon()
 		return
-	case "install":
+	}
+	if command == "install" {
 		runInstall()
 		return
-	case "uninstall":
+	}
+	if command == "uninstall" {
 		runUninstall()
 		return
 	}
@@ -66,21 +75,37 @@ func main() {
 		fatal("init tracker: %v", err)
 	}
 
-	switch os.Args[1] {
+	switch command {
 	case "start":
-		err = t.Start()
+		err = runStart(t, os.Args[2:])
+	case "pick":
+		err = runPick(t)
+	case "sync", "switch":
+		err = runSync(t)
+	case "ensure":
+		_, err = t.EnsureBranch()
 	case "stop":
-		err = t.Stop()
-	case "switch":
-		if err = t.Stop(); err == nil {
-			err = t.Start()
-		}
+		err = runStop(t)
+	case "pause":
+		err = runPause(t)
+	case "resume":
+		err = runResume(t)
+	case "toggle":
+		_, err = t.TogglePause()
+	case "status":
+		err = runStatus(t, len(os.Args) > 2 && os.Args[2] == "--bar")
 	case "report":
-		err = t.Report()
+		err = runReport(t, os.Args[2:])
 	case "upload":
-		err = runUpload(t)
+		err = queuePendingConfirmations(t)
+	case "confirm-upload":
+		if len(os.Args) != 4 {
+			err = fmt.Errorf("confirm-upload requires a session ID and claim token")
+		} else {
+			err = confirmUpload(t, os.Args[2], os.Args[3])
+		}
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", os.Args[1], usage)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n%s", command, usage)
 		os.Exit(1)
 	}
 
@@ -89,79 +114,333 @@ func main() {
 	}
 }
 
+func runReport(t *tracker.Tracker, args []string) error {
+	verbose := false
+	for _, arg := range args {
+		if arg != "--verbose" {
+			return fmt.Errorf("unknown report option %q", arg)
+		}
+		verbose = true
+	}
+	return t.Report(verbose)
+}
+
+func runStart(t *tracker.Tracker, args []string) error {
+	var taskID string
+	if len(args) > 0 {
+		var err error
+		taskID, err = tracker.ParseJiraKey(args[0])
+		if err != nil {
+			return err
+		}
+	} else if branchTask, err := tracker.TaskIDFromBranch(); err == nil {
+		taskID = branchTask
+	} else {
+		return runPick(t)
+	}
+
+	started, stopped, err := t.Start(taskID, "")
+	if err != nil {
+		return err
+	}
+	if stopped != nil {
+		queueConfirmation(t, stopped.ID)
+	}
+	if started != nil {
+		fmt.Printf("Tracking %s\n", started.TaskID)
+	}
+	return nil
+}
+
+func runPick(t *tracker.Tracker) error {
+	cfg, err := jira.LoadConfig()
+	if err != nil {
+		return err
+	}
+	issues, err := jira.AssignedIssues(cfg)
+	if err != nil {
+		return err
+	}
+	if len(issues) == 0 {
+		return fmt.Errorf("no unresolved Jira issues are assigned to you")
+	}
+
+	var input strings.Builder
+	for _, issue := range issues {
+		fmt.Fprintf(&input, "%s\t%s\t%s\n", issue.Key, issue.Status, strings.ReplaceAll(issue.Summary, "\n", " "))
+	}
+	cmd := exec.Command("fzf", "--delimiter=\t", "--with-nth=1,2,3", "--prompt=Jira issue > ", "--height=100%", "--border")
+	cmd.Stdin = strings.NewReader(input.String())
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		if cmd.ProcessState != nil && cmd.ProcessState.ExitCode() == 130 {
+			return nil
+		}
+		return fmt.Errorf("pick Jira issue: %w", err)
+	}
+	fields := strings.SplitN(strings.TrimSpace(string(out)), "\t", 3)
+	if len(fields) == 0 || fields[0] == "" {
+		return nil
+	}
+	summary := ""
+	if len(fields) == 3 {
+		summary = fields[2]
+	}
+	started, stopped, err := t.Start(fields[0], summary)
+	if err != nil {
+		return err
+	}
+	if stopped != nil {
+		queueConfirmation(t, stopped.ID)
+	}
+	if started != nil {
+		fmt.Printf("Tracking %s: %s\n", started.TaskID, started.Summary)
+	}
+	return nil
+}
+
+func runSync(t *tracker.Tracker) error {
+	started, stopped, err := t.SyncBranch()
+	if err != nil {
+		return err
+	}
+	if stopped != nil {
+		queueConfirmation(t, stopped.ID)
+	}
+	if started != nil {
+		fmt.Printf("Tracking %s\n", started.TaskID)
+	}
+	return nil
+}
+
+func runStop(t *tracker.Tracker) error {
+	stopped, err := t.Stop()
+	if err != nil {
+		return err
+	}
+	if stopped == nil {
+		fmt.Println("No active timer.")
+		return nil
+	}
+	fmt.Printf("Stopped %s after %s\n", stopped.TaskID, tracker.FormatDuration(stopped.Duration(stopped.EndedAt)))
+	queueConfirmation(t, stopped.ID)
+	return nil
+}
+
+func runPause(t *tracker.Tracker) error {
+	s, err := t.Pause("manual")
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		fmt.Println("No running timer to pause.")
+	} else {
+		fmt.Printf("Paused %s\n", s.TaskID)
+	}
+	return nil
+}
+
+func runResume(t *tracker.Tracker) error {
+	s, err := t.Resume()
+	if err != nil {
+		return err
+	}
+	if s == nil {
+		fmt.Println("No paused timer to resume.")
+	} else {
+		fmt.Printf("Resumed %s\n", s.TaskID)
+	}
+	return nil
+}
+
+func runStatus(t *tracker.Tracker, bar bool) error {
+	status, err := t.Status()
+	if err != nil {
+		return err
+	}
+	if !bar {
+		if status.Active == nil {
+			fmt.Println("No active timer.")
+		} else {
+			state := "running"
+			if status.Active.Paused() {
+				state = "paused"
+			}
+			fmt.Printf("%s %s (%s)\n", status.Active.TaskID, tracker.FormatDuration(status.Elapsed), state)
+		}
+		fmt.Printf("Pending uploads: %d\n", status.PendingCount)
+		return nil
+	}
+
+	output := map[string]any{"text": "No task", "tooltip": "Click to choose a Jira issue", "class": ""}
+	if status.Active != nil {
+		text := fmt.Sprintf("%s %s", status.Active.TaskID, shortDuration(status.Elapsed))
+		state := "Timer running"
+		if status.Active.Paused() {
+			text = status.Active.TaskID + " PAUSED"
+			state = "Timer paused"
+		}
+		tooltip := state
+		if status.Active.Summary != "" {
+			tooltip += "\n" + status.Active.Summary
+		}
+		output = map[string]any{"text": text, "tooltip": tooltip, "class": "active"}
+	}
+	if status.PendingCount > 0 {
+		output["text"] = fmt.Sprintf("%s !%d", output["text"], status.PendingCount)
+		output["tooltip"] = fmt.Sprintf("%s\n%d worklog(s) awaiting confirmation", output["tooltip"], status.PendingCount)
+	}
+	return json.NewEncoder(os.Stdout).Encode(output)
+}
+
+func shortDuration(d interface{ Minutes() float64 }) string {
+	total := int(d.Minutes())
+	return fmt.Sprintf("%02d:%02d", total/60, total%60)
+}
+
+func queuePendingConfirmations(t *tracker.Tracker) error {
+	pending, err := t.Pending()
+	if err != nil {
+		return err
+	}
+	if len(pending) == 0 {
+		fmt.Println("No worklogs are awaiting confirmation.")
+		return nil
+	}
+	for _, session := range pending {
+		queueConfirmation(t, session.ID)
+	}
+	fmt.Printf("Asked for confirmation on %d pending worklog(s).\n", len(pending))
+	return nil
+}
+
+func queueConfirmation(t *tracker.Tracker, sessionID string) {
+	token, claimed, err := t.ClaimConfirmation(sessionID)
+	if err != nil || !claimed {
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		_ = t.ReleaseConfirmation(sessionID, token)
+		return
+	}
+	cmd := exec.Command(executable, "confirm-upload", sessionID, token)
+	cmd.Stdin = nil
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err == nil {
+		_ = cmd.Process.Release()
+	} else {
+		_ = t.ReleaseConfirmation(sessionID, token)
+	}
+}
+
+func confirmUpload(t *tracker.Tracker, sessionID, token string) error {
+	session, err := t.FindClaimed(sessionID, token)
+	if err != nil {
+		return nil
+	}
+	duration := tracker.FormatDuration(session.Duration(session.EndedAt))
+	message := fmt.Sprintf("Upload %s to %s?", duration, session.TaskID)
+	if session.Summary != "" {
+		message += "\n" + session.Summary
+	}
+	cmd := exec.Command("notify-send", "--app-name=Timetracker", "--wait", "--action=default=Upload", "--action=upload=Upload", "--action=later=Later", "Log time to Jira", message)
+	out, err := cmd.Output()
+	if err != nil || !isUploadAction(string(out)) {
+		_ = t.ReleaseConfirmation(sessionID, token)
+		return nil
+	}
+	cfg, err := jira.LoadConfig()
+	if err == nil {
+		var exists bool
+		exists, err = jira.WorklogExists(cfg, session.TaskID, session.ID)
+		if err == nil && exists {
+			err = t.MarkUploaded(session.ID, token)
+			if err == nil {
+				notify("normal", "Time already logged", fmt.Sprintf("Found the existing Jira worklog for %s.", session.TaskID))
+			}
+			return err
+		}
+	}
+	if err == nil {
+		err = jira.UploadSession(cfg, session)
+	}
+	if err != nil {
+		_ = t.MarkUploadFailed(session.ID, err)
+		notify("critical", "Jira worklog failed", fmt.Sprintf("%s remains pending.\n%s", session.TaskID, err))
+		return err
+	}
+	if err := t.MarkUploaded(session.ID, token); err != nil {
+		return err
+	}
+	notify("normal", "Time logged", fmt.Sprintf("Uploaded %s to %s.", duration, session.TaskID))
+	return nil
+}
+
+func isUploadAction(action string) bool {
+	action = strings.TrimSpace(action)
+	return action == "default" || action == "upload"
+}
+
+func notify(urgency, title, body string) {
+	_ = exec.Command("notify-send", "--app-name=Timetracker", "--urgency="+urgency, title, body).Run()
+}
+
+func runDaemon() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer cancel()
+	if err := daemon.Run(ctx); err != nil {
+		fatal("daemon: %v", err)
+	}
+}
+
 func runInstall() {
 	repoRoot, err := gitRepoRoot()
 	if err != nil {
 		fatal("not inside a git repository: %v", err)
 	}
-
 	binaryPath, err := os.Executable()
 	if err != nil {
 		fatal("resolve binary path: %v", err)
 	}
-
-	if resolved, err := filepath.EvalSymlinks(binaryPath); err == nil {
+	if resolved, resolveErr := filepath.EvalSymlinks(binaryPath); resolveErr == nil {
 		binaryPath = resolved
 	}
-
-	fmt.Printf("Installing timetracker in %s\n\n", repoRoot)
-
 	if err := writeHook(repoRoot, "post-checkout", hookPostCheckout); err != nil {
 		fatal("write post-checkout hook: %v", err)
 	}
 	if err := writeHook(repoRoot, "post-commit", hookPostCommit); err != nil {
 		fatal("write post-commit hook: %v", err)
 	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		fatal("load config: %v", err)
 	}
-	added := cfg.AddRepo(repoRoot)
+	cfg.AddRepo(repoRoot)
 	if err := cfg.Save(); err != nil {
 		fatal("save config: %v", err)
 	}
-	if added {
-		fmt.Printf("  registered repo: %s\n", repoRoot)
+	if err := platform.InstallDaemon(binaryPath); err != nil {
+		fatal("install daemon: %v", err)
 	}
-
-	if platform.DaemonInstalled() {
-		if err := restartDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not restart daemon: %v\n", err)
-		} else {
-			fmt.Println("  restarted daemon to pick up new repo")
-		}
-	} else {
-		if err := platform.InstallDaemon(binaryPath); err != nil {
-			fatal("install daemon: %v", err)
-		}
-	}
-
-	fmt.Println()
-	fmt.Println("Done. Timetracker will now:")
-	fmt.Println("  • start/switch sessions automatically on branch changes")
-	fmt.Println("  • stop sessions after 30 min of git inactivity")
-	fmt.Println()
-	fmt.Println("Run 'timetracker start' to begin tracking now.")
+	fmt.Println("Installed Git hooks and lock watcher.")
 }
 
 func writeHook(repoRoot, name, content string) error {
-	hookPath := filepath.Join(repoRoot, ".git", "hooks", name)
-
-	if existing, err := os.ReadFile(hookPath); err == nil {
-		if !strings.Contains(string(existing), hookMarker) {
-			fmt.Printf("  warning: %s hook already exists and was not created by timetracker — skipping\n", name)
-			fmt.Printf("           add the following line manually: timetracker %s\n",
-				map[string]string{"post-checkout": "switch", "post-commit": "start"}[name])
-			return nil
-		}
-	}
-
-	if err := os.WriteFile(hookPath, []byte(content), 0o755); err != nil {
+	hooksPath, err := gitHooksPath(repoRoot)
+	if err != nil {
 		return err
 	}
-	fmt.Printf("  wrote %s\n", hookPath)
-	return nil
+	if err := os.MkdirAll(hooksPath, 0o755); err != nil {
+		return err
+	}
+	hookPath := filepath.Join(hooksPath, name)
+	if existing, readErr := os.ReadFile(hookPath); readErr == nil && !strings.Contains(string(existing), hookMarker) {
+		return fmt.Errorf("%s already exists and is not managed by timetracker", hookPath)
+	}
+	return os.WriteFile(hookPath, []byte(content), 0o755)
 }
 
 func runUninstall() {
@@ -169,30 +448,14 @@ func runUninstall() {
 	if err != nil {
 		fatal("not inside a git repository: %v", err)
 	}
-
-	fmt.Printf("Uninstalling timetracker from %s\n\n", repoRoot)
-
+	hooksPath, _ := gitHooksPath(repoRoot)
 	for _, name := range []string{"post-checkout", "post-commit"} {
-		hookPath := filepath.Join(repoRoot, ".git", "hooks", name)
-		data, err := os.ReadFile(hookPath)
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: read %s: %v\n", name, err)
-			continue
-		}
-		if !strings.Contains(string(data), hookMarker) {
-			fmt.Printf("  skipping %s — not managed by timetracker\n", name)
-			continue
-		}
-		if err := os.Remove(hookPath); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: remove %s: %v\n", hookPath, err)
-		} else {
-			fmt.Printf("  removed %s\n", hookPath)
+		path := filepath.Join(hooksPath, name)
+		data, readErr := os.ReadFile(path)
+		if readErr == nil && strings.Contains(string(data), hookMarker) {
+			_ = os.Remove(path)
 		}
 	}
-
 	cfg, err := config.Load()
 	if err != nil {
 		fatal("load config: %v", err)
@@ -201,88 +464,33 @@ func runUninstall() {
 	if err := cfg.Save(); err != nil {
 		fatal("save config: %v", err)
 	}
-	fmt.Printf("  unregistered repo: %s\n", repoRoot)
-
 	if len(cfg.Repos) == 0 {
-		fmt.Println("  no more repos — removing daemon")
 		if err := platform.UninstallDaemon(); err != nil {
 			fatal("uninstall daemon: %v", err)
 		}
 	} else {
-		if err := restartDaemon(); err != nil {
-			fmt.Fprintf(os.Stderr, "  warning: could not restart daemon: %v\n", err)
-		} else {
-			fmt.Println("  restarted daemon")
-		}
+		_ = restartDaemon()
 	}
-
-	fmt.Println("\nDone.")
-}
-
-func runDaemon() {
-	cfg, err := config.Load()
-	if err != nil {
-		fatal("load config: %v", err)
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
-
-	if err := daemon.Run(ctx, cfg.Repos, cfg.IdleTimeout.Duration); err != nil {
-		fatal("daemon: %v", err)
-	}
-}
-
-func runUpload(t *tracker.Tracker) error {
-	summaries, err := t.Summarize()
-	if err != nil {
-		return err
-	}
-	if len(summaries) == 0 {
-		fmt.Println("Nothing to upload — no pending closed sessions.")
-		return nil
-	}
-
-	fmt.Println("\nPending time to upload to Jira:")
-	fmt.Println()
-	fmt.Printf("  %-12s  %s\n", "TASK", "TIME")
-	fmt.Println("  " + strings.Repeat("-", 28))
-	for _, ts := range summaries {
-		h := int(ts.Total.Hours())
-		m := int(ts.Total.Minutes()) % 60
-		fmt.Printf("  %-12s  %dh%02dm\n", ts.TaskID, h, m)
-	}
-	fmt.Println()
-
-	if !confirm("Upload these worklogs to Jira? [y/N] ") {
-		fmt.Println("Aborted.")
-		return nil
-	}
-
-	cfg, err := jira.LoadConfig()
-	if err != nil {
-		return err
-	}
-
-	fmt.Println("\nUploading...")
-	if err := jira.UploadWorklog(cfg, summaries); err != nil {
-		return err
-	}
-
-	if err := t.MarkUploaded(); err != nil {
-		return fmt.Errorf("uploaded to Jira but failed to mark sessions locally: %w", err)
-	}
-
-	fmt.Println("Done.")
-	return nil
+	fmt.Println("Uninstalled timetracker from this repository.")
 }
 
 func gitRepoRoot() (string, error) {
 	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func gitHooksPath(repoRoot string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "--git-path", "hooks")
+	cmd.Dir = repoRoot
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(out)), nil
+	path := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repoRoot, path)
+	}
+	return filepath.Clean(path), nil
 }
 
 func restartDaemon() error {
@@ -290,23 +498,14 @@ func restartDaemon() error {
 	case platform.KindSystemd:
 		return exec.Command("systemctl", "--user", "restart", "timetracker").Run()
 	case platform.KindLaunchd:
-		return exec.Command("launchctl", "kickstart", "-k",
-			"gui/"+fmt.Sprint(os.Getuid())+"/com.timetracker.daemon").Run()
+		return exec.Command("launchctl", "kickstart", "-k", "gui/"+fmt.Sprint(os.Getuid())+"/com.timetracker.daemon").Run()
 	}
 	return nil
 }
 
-func confirm(prompt string) bool {
-	fmt.Print(prompt)
-	scanner := bufio.NewScanner(os.Stdin)
-	if !scanner.Scan() {
-		return false
-	}
-	answer := strings.ToLower(strings.TrimSpace(scanner.Text()))
-	return answer == "y" || answer == "yes"
-}
-
 func fatal(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "error: "+format+"\n", args...)
+	var buffer bytes.Buffer
+	fmt.Fprintf(&buffer, format, args...)
+	fmt.Fprintln(os.Stderr, "error: "+buffer.String())
 	os.Exit(1)
 }

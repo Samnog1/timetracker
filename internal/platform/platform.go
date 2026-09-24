@@ -75,7 +75,7 @@ func DaemonInstalled() bool {
 }
 
 var systemdUnitTmpl = template.Must(template.New("unit").Parse(`[Unit]
-Description=Timetracker idle watchdog
+Description=Timetracker Omarchy lock watcher
 After=default.target
 
 [Service]
@@ -106,6 +106,7 @@ func installSystemd(binaryPath string) error {
 	for _, args := range [][]string{
 		{"--user", "daemon-reload"},
 		{"--user", "enable", "--now", serviceNameSystemd},
+		{"--user", "restart", serviceNameSystemd},
 	} {
 		if out, err := exec.Command("systemctl", args...).CombinedOutput(); err != nil {
 			return fmt.Errorf("systemctl %s: %w\n%s", strings.Join(args, " "), err, out)

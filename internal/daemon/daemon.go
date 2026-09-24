@@ -4,77 +4,90 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sync"
+	"os/exec"
+	"strings"
 	"time"
 
 	"github.com/SaNog2/timetracker/internal/tracker"
 )
 
-const pollInterval = 60 * time.Second
+const pollInterval = 2 * time.Second
 
-func Run(ctx context.Context, repos []string, idleTimeout time.Duration) error {
-	if len(repos) == 0 {
-		fmt.Println("daemon: no repos configured, waiting for install")
-		<-ctx.Done()
-		return nil
-	}
-
+func Run(ctx context.Context) error {
 	t, err := tracker.New()
 	if err != nil {
 		return fmt.Errorf("daemon: init tracker: %w", err)
 	}
 
-	var wg sync.WaitGroup
-	for _, repo := range repos {
-		wg.Add(1)
-		go func(repo string) {
-			defer wg.Done()
-			watchRepo(ctx, t, repo, idleTimeout)
-		}(repo)
-	}
-	wg.Wait()
-	return nil
-}
-
-func watchRepo(ctx context.Context, t *tracker.Tracker, repo string, idleTimeout time.Duration) {
-	indexPath := filepath.Join(repo, ".git", "index")
+	locked := false
+	initialized := false
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
+	check := func() {
+		current, err := lockState()
+		if err != nil {
+			return
+		}
+		if !initialized {
+			initialized = true
+			locked = current
+			if current {
+				_, _ = t.Pause("lock")
+			}
+			return
+		}
+		if current == locked {
+			return
+		}
+		locked = current
+		if current {
+			if _, err := t.Pause("lock"); err != nil {
+				fmt.Fprintf(os.Stderr, "daemon: pause on lock: %v\n", err)
+			}
+			return
+		}
+		status, err := t.Status()
+		if err == nil && status.Active != nil && status.Active.Paused() && status.Active.PauseReason == "lock" {
+			go offerResume(t, status.Active.ID, status.Active.TaskID)
+		}
+	}
+
+	check()
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-ticker.C:
-			if err := checkIdle(t, repo, indexPath, idleTimeout); err != nil {
-				fmt.Fprintf(os.Stderr, "daemon: %s: %v\n", repo, err)
-			}
+			check()
 		}
 	}
 }
 
-func checkIdle(t *tracker.Tracker, repo string, indexPath string, idleTimeout time.Duration) error {
-	info, err := os.Stat(indexPath)
-	if os.IsNotExist(err) {
-		return nil
-	}
+func lockState() (bool, error) {
+	out, err := exec.Command("omarchy", "shell", "lock", "isLocked").Output()
 	if err != nil {
-		return fmt.Errorf("stat %s: %w", indexPath, err)
+		return false, err
 	}
+	return strings.TrimSpace(string(out)) == "true", nil
+}
 
-	idleSince := time.Since(info.ModTime())
-	if idleSince < idleTimeout {
-		return nil
+func offerResume(t *tracker.Tracker, sessionID, taskID string) {
+	out, err := exec.Command("notify-send", "--app-name=Timetracker", "--wait", "--action=default=Resume", "--action=resume=Resume", "--action=later=Later", "Resume "+taskID+"?", "Click to resume the timer.").Output()
+	if err != nil || !isResumeAction(string(out)) {
+		return
 	}
+	locked, err := lockState()
+	if err != nil || locked {
+		return
+	}
+	status, err := t.Status()
+	if err == nil && status.Active != nil && status.Active.ID == sessionID && status.Active.Paused() && status.Active.PauseReason == "lock" {
+		_, _ = t.Resume()
+	}
+}
 
-	stopped, err := t.StopIfOpen(repo)
-	if err != nil {
-		return fmt.Errorf("stop session: %w", err)
-	}
-	if stopped {
-		fmt.Printf("daemon: stopped idle session in %s (idle for %s)\n",
-			filepath.Base(repo), idleSince.Round(time.Minute))
-	}
-	return nil
+func isResumeAction(action string) bool {
+	action = strings.TrimSpace(action)
+	return action == "default" || action == "resume"
 }
